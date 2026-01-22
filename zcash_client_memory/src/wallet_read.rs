@@ -7,11 +7,12 @@ use nonempty::NonEmpty;
 use secrecy::{ExposeSecret, SecretVec};
 use shardtree::store::ShardStore as _;
 use zcash_client_backend::data_api::{
-    AddressInfo, BlockMetadata, NullifierQuery, ReceivedTransactionOutput, WalletRead,
+    AddressInfo, AddressSource, BlockMetadata, NullifierQuery, ReceivedTransactionOutput, WalletRead,
     WalletSummary, Zip32Derivation,
     scanning::ScanRange,
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
+use zcash_keys::address::Address;
 use zcash_client_backend::{
     data_api::{
         Account as _, AccountBalance, AccountSource, Balance, Progress, Ratio, SeedRelevance,
@@ -726,8 +727,24 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             .collect())
     }
 
-    fn list_addresses(&self, _account: Self::AccountId) -> Result<Vec<AddressInfo>, Self::Error> {
-        todo!()
+    fn list_addresses(&self, account: Self::AccountId) -> Result<Vec<AddressInfo>, Self::Error> {
+        let acc = self
+            .accounts
+            .get(account)
+            .ok_or(Error::AccountUnknown(account))?;
+
+        let mut addresses = Vec::new();
+        for (diversifier_index, ua) in acc.addresses().iter() {
+            let source = AddressSource::Derived {
+                diversifier_index: *diversifier_index,
+                #[cfg(feature = "transparent-inputs")]
+                transparent_key_scope: None,
+            };
+            if let Some(addr_info) = AddressInfo::from_parts(Address::Unified(ua.clone()), source) {
+                addresses.push(addr_info);
+            }
+        }
+        Ok(addresses)
     }
 
     fn get_last_generated_address_matching(
