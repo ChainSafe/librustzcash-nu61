@@ -217,13 +217,14 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             .map(|account| (account.account_id(), AccountBalance::ZERO))
             .collect::<HashMap<AccountId, AccountBalance>>();
 
+        let unscanned = self.unscanned_ranges();
         for note in self.get_received_notes().iter() {
             // don't count spent notes
             if self.note_is_spent(note, target_height)? {
                 continue;
             }
             // don't count notes in unscanned ranges
-            let in_unscanned = self.unscanned_ranges().iter().any(
+            let in_unscanned = unscanned.iter().any(
                 |(_, _, start_position, end_position_exclusive)| {
                     note.commitment_tree_position >= *start_position
                         && note.commitment_tree_position < *end_position_exclusive
@@ -403,13 +404,12 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             // the scan queue with priority "Scanned".
             // SQL query problems.
 
-            let mut scanned_ranges: Vec<_> = self
+            if let Some(fully_scanned_height) = self
                 .scan_queue
                 .iter()
                 .filter(|(_, _, p)| p == &ScanPriority::Scanned)
-                .collect();
-            scanned_ranges.sort_by(|(start_a, _, _), (start_b, _, _)| start_a.cmp(start_b));
-            if let Some(fully_scanned_height) = scanned_ranges.first().and_then(
+                .min_by_key(|(start, _, _)| *start)
+                .and_then(
                 |(block_range_start, block_range_end, _priority)| {
                     // If the start of the earliest scanned range is greater than
                     // the birthday height, then there is an unscanned range between
