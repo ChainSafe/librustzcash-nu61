@@ -7,11 +7,12 @@ use nonempty::NonEmpty;
 use secrecy::{ExposeSecret, SecretVec};
 use shardtree::store::ShardStore as _;
 use zcash_client_backend::data_api::{
-    AddressInfo, BlockMetadata, NullifierQuery, ReceivedTransactionOutput, WalletRead,
+    AddressInfo, AddressSource, BlockMetadata, NullifierQuery, ReceivedTransactionOutput, WalletRead,
     WalletSummary, Zip32Derivation,
     scanning::ScanRange,
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
+use zcash_keys::address::Address;
 use zcash_client_backend::{
     data_api::{
         Account as _, AccountBalance, AccountSource, Balance, Progress, Ratio, SeedRelevance,
@@ -216,24 +217,33 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             .map(|account| (account.account_id(), AccountBalance::ZERO))
             .collect::<HashMap<AccountId, AccountBalance>>();
 
+        let unscanned = self.unscanned_ranges();
         for note in self.get_received_notes().iter() {
             // don't count spent notes
             if self.note_is_spent(note, target_height)? {
                 continue;
             }
             // don't count notes in unscanned ranges
-            let unscanned_ranges = self.unscanned_ranges();
-            for (_, _, start_position, end_position_exclusive) in unscanned_ranges {
-                if note.commitment_tree_position >= start_position
-                    && note.commitment_tree_position < end_position_exclusive
-                {
-                    continue; // note is in an unscanned range. Skip it
-                }
+            let in_unscanned = unscanned.iter().any(
+                |(_, _, start_position, end_position_exclusive)| {
+                    note.commitment_tree_position >= *start_position
+                        && note.commitment_tree_position < *end_position_exclusive
+                },
+            );
+            if in_unscanned {
+                continue;
             }
-            // don't count notes in unmined transactions or that have expired
-            if let Ok(Some(note_tx)) = self.get_transaction(note.txid) {
-                if note_tx.expiry_height() < BlockHeight::from(target_height) {
-                    continue;
+            // Don't count notes from expired unmined transactions.
+            // Mined transactions are final — their expiry height is irrelevant.
+            if let Some(tx_entry) = self.tx_table.get(&note.txid) {
+                if !matches!(tx_entry.status(), TransactionStatus::Mined(_)) {
+                    if let Some(expiry) = tx_entry.expiry_height() {
+                        if expiry > BlockHeight::from(0u32)
+                            && expiry < BlockHeight::from(target_height)
+                        {
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -394,13 +404,12 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             // the scan queue with priority "Scanned".
             // SQL query problems.
 
-            let mut scanned_ranges: Vec<_> = self
+            if let Some(fully_scanned_height) = self
                 .scan_queue
                 .iter()
                 .filter(|(_, _, p)| p == &ScanPriority::Scanned)
-                .collect();
-            scanned_ranges.sort_by(|(start_a, _, _), (start_b, _, _)| start_a.cmp(start_b));
-            if let Some(fully_scanned_height) = scanned_ranges.first().and_then(
+                .min_by_key(|(start, _, _)| *start)
+                .and_then(
                 |(block_range_start, block_range_end, _priority)| {
                     // If the start of the earliest scanned range is greater than
                     // the birthday height, then there is an unscanned range between
@@ -651,12 +660,10 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             .get_account(account_id)?
             .ok_or(Error::AccountUnknown(account_id))?;
 
-        if _include_change {
-            unimplemented!("include_change is not yet supported");
-        }
-        if _include_standalone {
-            unimplemented!("include_standalone is not yet supported");
-        }
+        // NOTE: For the memory wallet, we only track external (receiving) addresses.
+        // Change addresses (Internal scope) are not separately tracked - they're derived
+        // on-demand during transaction creation. Standalone addresses are not supported.
+        // We simply return the external addresses regardless of the include_* flags.
 
         let t_addresses = account
             .addresses()
@@ -719,6 +726,37 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
         Ok(balances)
     }
 
+    #[cfg(feature = "transparent-inputs")]
+    fn get_transparent_address_metadata(
+        &self,
+        account: Self::AccountId,
+        address: &TransparentAddress,
+    ) -> Result<Option<TransparentAddressMetadata>, Self::Error> {
+        let acc = self
+            .get_account(account)?
+            .ok_or(Error::AccountUnknown(account))?;
+
+        // Search through account addresses for matching transparent receiver
+        for (diversifier_index, ua) in acc.addresses().iter() {
+            if let Some(transparent_addr) = ua.transparent() {
+                if transparent_addr == address {
+                    let metadata = TransparentAddressMetadata::derived(
+                        Scope::External.into(),
+                        NonHardenedChildIndex::from_index((*diversifier_index).try_into().unwrap())
+                            .expect(
+                                "diversifier index corresponds to a valid NonHardenedChildIndex",
+                            ),
+                        Exposure::Unknown,
+                        None,
+                    );
+                    return Ok(Some(metadata));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn transaction_data_requests(&self) -> Result<Vec<TransactionDataRequest>, Self::Error> {
         tracing::debug!("transaction_data_requests");
         Ok(self
@@ -728,21 +766,47 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
             .collect())
     }
 
-    fn list_addresses(&self, _account: Self::AccountId) -> Result<Vec<AddressInfo>, Self::Error> {
-        todo!()
+    fn list_addresses(&self, account: Self::AccountId) -> Result<Vec<AddressInfo>, Self::Error> {
+        let acc = self
+            .accounts
+            .get(account)
+            .ok_or(Error::AccountUnknown(account))?;
+
+        let mut addresses = Vec::new();
+        for (diversifier_index, ua) in acc.addresses().iter() {
+            let source = AddressSource::Derived {
+                diversifier_index: *diversifier_index,
+                #[cfg(feature = "transparent-inputs")]
+                transparent_key_scope: None,
+            };
+            if let Some(addr_info) = AddressInfo::from_parts(Address::Unified(ua.clone()), source) {
+                addresses.push(addr_info);
+            }
+        }
+        Ok(addresses)
     }
 
     fn get_last_generated_address_matching(
         &self,
-        _account: Self::AccountId,
+        account: Self::AccountId,
         _address_filter: UnifiedAddressRequest,
     ) -> Result<Option<UnifiedAddress>, Self::Error> {
-        todo!()
+        // Return the last (highest diversifier index) generated address for this account
+        // For now, we return the current address which is the most recently generated one
+        Ok(self
+            .accounts
+            .get(account)
+            .and_then(|acc| acc.addresses().values().last().cloned()))
     }
 
     #[cfg(feature = "transparent-inputs")]
-    fn utxo_query_height(&self, _account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
-        todo!()
+    fn utxo_query_height(&self, account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
+        // Return the account's birthday height as the starting point for UTXO queries.
+        // This is the same fallback behavior as zcash_client_sqlite when no transactions exist.
+        self.accounts
+            .get(account)
+            .map(|acc| acc.birthday().height())
+            .ok_or(Error::AccountUnknown(account))
     }
 
     fn get_received_outputs(
